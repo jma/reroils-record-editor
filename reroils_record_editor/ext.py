@@ -48,7 +48,7 @@ class ReroilsRecordEditor(object):
         """Flask application initialization."""
         self.init_config(app)
         opt = app.config['REROILS_RECORD_EDITOR_OPTIONS']
-        app.register_blueprint(create_blueprint(opt))
+        app.register_blueprint(create_blueprint(opt, app))
         app.extensions['reroils-record-editor'] = self
 
     def init_config(self, app):

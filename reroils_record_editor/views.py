@@ -48,96 +48,156 @@ from .permissions import can_edit, record_edit_permission
 from .utils import clean_dict_keys, delete_record, get_schema, \
     get_schema_url, remove_pid, resolve, save_record
 
+from flask_admin import BaseView, expose
+from invenio_admin.permissions import admin_permission_factory as default_admin_permission_factory
 
-@record_edit_permission.require()
-def search(record_type, endpoints):
-    """Create a search view given a record type."""
-    cfg = endpoints.get(record_type)
-    if not cfg or not cfg.get('api'):
-        abort(404)
-    template = cfg.get('search_template')
-    api = cfg.get('api')
-    results_template = cfg.get('results_template')
-    res_tmpl = url_for('static',
-                       filename=results_template)
-    return render_template(template, search_api=api,
-                           record_type=record_type,
-                           search_results_template=res_tmpl)
+class ResourceView(BaseView):
+
+    def is_accessible(self):
+        app_config = current_app.config
+        cfg = app_config.get('REROILS_RECORD_EDITOR_OPTIONS')
+        cfg = cfg.get(self.endpoint)
+        if not cfg.get('api'):
+            return False
+        return (can_edit() or default_admin_permission_factory(self).can())
+
+    @expose('/')
+    def index_view(self):
+        """
+            List view
+        """
+        app_config = current_app.config
+        cfg = app_config.get('REROILS_RECORD_EDITOR_OPTIONS')
+        cfg = cfg.get(self.endpoint)
+        if not cfg:
+            abort(404)
+        api = cfg.get('api', app_config.get('SEARCH_UI_SEARCH_API'))
+        search_template = cfg.get(
+            'results_template',
+            app_config.get('SEARCH_UI_JSTEMPLATE_RESULTS')
+        )
+        search_index = app_config.get('RECORDS_REST_ENDPOINTS', {}) \
+            .get(self.endpoint, {}) \
+            .get('search_index', app_config.get('SEARCH_UI_SEARCH_INDEX'))
+        return render_template(
+            'rero_ils/search.html', search_api=api,
+            search_results_template=search_template,
+            search_index=search_index,
+            record_type=self.endpoint
+        )
+
+    @expose('/new', methods=('GET', 'POST'))
+    def create_view(self):
+        """
+            Create model view
+        """
+        app_config = current_app.config
+        cfg = app_config.get('REROILS_RECORD_EDITOR_OPTIONS')
+        cfg = cfg.get(self.endpoint)
+        default_template = app_config[
+            'REROILS_RECORD_EDITOR_EDITOR_TEMPLATE'
+        ]
+        template = cfg.get('editor_template', default_template)
+        schema = cfg.get('schema')
+        if not cfg or not schema:
+            abort(404)
+
+        form_options = cfg.get('form_options')
+        schema_url = get_schema_url(schema)
+
+        if form_options:
+            options_in_bytes = resource_string(*form_options)
+            form_options = loads(options_in_bytes.decode('utf8'))
+
+            for key_to_remove in cfg.get('form_options_create_exclude', []):
+                remove_pid(form_options, key_to_remove)
+            keys = current_app.config['REROILS_RECORD_EDITOR_TRANSLATE_JSON_KEYS']
+            form_options = translate(form_options, keys=keys)
+        return render_template(
+            template,
+            form=form_options or ['*'],
+            model={'$schema': schema_url},
+            schema=get_schema(schema),
+            api_save_url='/editor/save/%s' % self.endpoint,
+            record_type=self.endpoint
+        )
+
+    @expose('/edit/<pid>', methods=('GET', 'POST'))
+    def edit_view(self, pid):
+        """
+            Edit model view
+        """
+        app_config = current_app.config
+        cfg = app_config.get('REROILS_RECORD_EDITOR_OPTIONS')
+        cfg = cfg.get(self.endpoint)
+        record_type = self.endpoint
+        default_template = current_app.config[
+            'REROILS_RECORD_EDITOR_EDITOR_TEMPLATE'
+        ]
+        template = cfg.get('editor_template', default_template)
+        schema = cfg.get('schema')
+        if not cfg or not schema:
+            abort(404)
+
+        form_options = cfg.get('form_options')
+        schema_url = get_schema_url(schema)
+
+        if form_options:
+            options_in_bytes = resource_string(*form_options)
+            form_options = loads(options_in_bytes.decode('utf8'))
+
+            keys = current_app.config['REROILS_RECORD_EDITOR_TRANSLATE_JSON_KEYS']
+            form_options = translate(form_options, keys=keys)
+
+        try:
+            pid, rec = resolve(record_type, pid)
+        except PIDDoesNotExistError:
+            flash(_('The record %s does not exists.' % pid), 'danger')
+            abort(404)
+
+        return render_template(
+            template,
+            form=form_options or ['*'],
+            model=rec,
+            schema=get_schema(schema),
+            api_save_url='/editor/save/%s' % record_type,
+            record_type=record_type
+        )
+
+    @expose('/delete/<pid>', methods=('POST', 'GET'))
+    def delete_view(self, pid):
+        """
+            Delete model view. Only POST method is allowed.
+        """
+        app_config = current_app.config
+        cfg = app_config.get('REROILS_RECORD_EDITOR_OPTIONS')
+        cfg = cfg.get(self.endpoint)
+        record_type = self.endpoint
+        record_indexer = cfg.get('indexer_class') or RecordIndexer
+        _delete_record = obj_or_import_string(cfg.get('delete_record')) \
+            or delete_record
+        try:
+            _next, pid = _delete_record(record_type, pid, record_indexer)
+        except PIDDoesNotExistError:
+            flash(_('The record %s does not exists.' % pid.pid_value), 'danger')
+            abort(404)
+        except Exception as e:
+            raise(e)
+            flash(_('An error occured on the server.'), 'danger')
+            abort(500)
+
+        flash(_('The record %s has been deleted.' % pid.pid_value), 'success')
+
+        return redirect(_next)
+
+    @expose('/ajax/update/', methods=('POST',))
+    def ajax_update(self):
+        """
+            Edits a single column of a record in list view.
+        """
+        pass
 
 
-@record_edit_permission.require()
-def create(record_type, endpoints):
-    """Editor view for a new record for a given record type."""
-    parent_pid = request.args.get('parent_pid')
-    cfg = endpoints.get(record_type)
-    default_template = current_app.config[
-        'REROILS_RECORD_EDITOR_EDITOR_TEMPLATE'
-    ]
-    template = cfg.get('editor_template', default_template)
-    schema = cfg.get('schema')
-    if not cfg or not schema:
-        abort(404)
-
-    form_options = cfg.get('form_options')
-    schema_url = get_schema_url(schema)
-
-    if form_options:
-        options_in_bytes = resource_string(*form_options)
-        form_options = loads(options_in_bytes.decode('utf8'))
-
-        for key_to_remove in cfg.get('form_options_create_exclude', []):
-            remove_pid(form_options, key_to_remove)
-        keys = current_app.config['REROILS_RECORD_EDITOR_TRANSLATE_JSON_KEYS']
-        form_options = translate(form_options, keys=keys)
-    return render_template(
-        template,
-        form=form_options or ['*'],
-        model={'$schema': schema_url},
-        schema=get_schema(schema),
-        api_save_url='/editor/save/%s' % record_type,
-        record_type=record_type,
-        parent_pid=parent_pid
-    )
-
-
-@record_edit_permission.require()
-def update(record_type, pid, endpoints):
-    """Edior view to update an existing record."""
-    parent_pid = request.args.get('parent_pid')
-    cfg = endpoints.get(record_type)
-    default_template = current_app.config[
-        'REROILS_RECORD_EDITOR_EDITOR_TEMPLATE'
-    ]
-    template = cfg.get('editor_template', default_template)
-    schema = cfg.get('schema')
-    if not cfg or not schema:
-        abort(404)
-
-    form_options = cfg.get('form_options')
-    schema_url = get_schema_url(schema)
-
-    if form_options:
-        options_in_bytes = resource_string(*form_options)
-        form_options = loads(options_in_bytes.decode('utf8'))
-
-        keys = current_app.config['REROILS_RECORD_EDITOR_TRANSLATE_JSON_KEYS']
-        form_options = translate(form_options, keys=keys)
-
-    try:
-        pid, rec = resolve(record_type, pid)
-    except PIDDoesNotExistError:
-        flash(_('The record %s does not exists.' % pid), 'danger')
-        abort(404)
-
-    return render_template(
-        template,
-        form=form_options or ['*'],
-        model=rec,
-        schema=get_schema(schema),
-        api_save_url='/editor/save/%s' % record_type,
-        record_type=record_type,
-        parent_pid=parent_pid
-    )
 
 
 @record_edit_permission.require()
@@ -224,27 +284,28 @@ def permission_denied_page(error):
     return render_template(current_app.config['THEME_403_TEMPLATE']), 403
 
 
-def init_menu(endpoints):
-    """Initialize menu before first request."""
-    item = current_menu.submenu('main.manage')
-    item.register(
-        endpoint=None,
-        text=_('Manage'),
-        visible_when=can_edit,
-        order=0
-    )
-    for record_type in endpoints.keys():
-        if endpoints.get(record_type, {}).get('api'):
-            subitem = current_menu.submenu('main.manage.%s' % record_type)
-            icon = '<i class="fa fa-pencil-square-o fa-fw"></i> '
-            subitem.register(
-                endpoint='reroils_record_editor.search_%s' % record_type,
-                text=icon + _(record_type),
-                visible_when=can_edit
-            )
+# def init_menu(endpoints):
+#     """Initialize menu before first request."""
+#     return
+#     item = current_menu.submenu('main.manage')
+#     item.register(
+#         endpoint=None,
+#         text=_('Manage'),
+#         visible_when=can_edit,
+#         order=0
+#     )
+#     for record_type in endpoints.keys():
+#         if endpoints.get(record_type, {}).get('api'):
+#             subitem = current_menu.submenu('main.manage.%s' % record_type)
+#             icon = '<i class="fa fa-pencil-square-o fa-fw"></i> '
+#             subitem.register(
+#                 endpoint='reroils_record_editor.search_%s' % record_type,
+#                 text=icon + _(record_type),
+#                 visible_when=can_edit,
+#             )
 
 
-def create_blueprint(endpoints):
+def create_blueprint(endpoints, app):
     """Create Invenio-Records-REST blueprint.
 
     :params endpoints: Dictionary representing the endpoints configuration.
@@ -264,36 +325,15 @@ def create_blueprint(endpoints):
     blueprint.add_app_template_filter(jsondumps)
     blueprint.register_error_handler(PermissionDenied,
                                      permission_denied_page)
-    menu_func = partial(init_menu, endpoints=endpoints)
-    menu_func.__module__ = init_menu.__module__
-    menu_func.__name__ = init_menu.__name__
-    blueprint.before_app_request(menu_func)
+    adm = app.extensions['invenio-admin']
+
     for rec_type in rec_types:
-        # search view
-        if endpoints.get(rec_type, {}).get('api'):
-            search_func = partial(search, record_type=rec_type,
-                                  endpoints=endpoints)
-            search_func.__module__ = search.__module__
-            search_func.__name__ = search.__name__
-            blueprint.add_url_rule('/search/%s' % rec_type,
-                                   endpoint='search_%s' % rec_type,
-                                   view_func=search_func)
-        # create view
-        create_func = partial(create, record_type=rec_type,
-                              endpoints=endpoints)
-        create_func.__module__ = create.__module__
-        create_func.__name__ = create.__name__
-        blueprint.add_url_rule('/create/%s' % rec_type,
-                               endpoint='create_%s' % rec_type,
-                               view_func=create_func)
-        # update view
-        update_func = partial(update, record_type=rec_type,
-                              endpoints=endpoints)
-        update_func.__module__ = update.__module__
-        update_func.__name__ = update.__name__
-        blueprint.add_url_rule('/update/%s/<int:pid>' % rec_type,
-                               endpoint='update_%s' % rec_type,
-                               view_func=update_func)
+        adm.register_view(ResourceView, **dict(
+            name=rec_type, category='Resources',
+            menu_icon_type='fa', menu_icon_value='fa-pencil-square-o',
+            endpoint=rec_type)
+        )
+
         # delete view
         delete_func = partial(delete, record_type=rec_type,
                               endpoints=endpoints)
